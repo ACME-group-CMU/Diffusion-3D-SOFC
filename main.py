@@ -10,18 +10,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader,random_split
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import pytorch_lightning as pl
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
-
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from data import Microstructures
-from model import Unet, UNet_New
-#from new_model import SimpleUnet
-from diffusers import DDIMScheduler
-from pipeline import DDIMPipeline
-from diffusers.optimization import get_cosine_schedule_with_warmup
+from unet import UNet
+from sampler import DDIMSampler
 
 #import warnings
 #warnings.filterwarnings('ignore')
@@ -34,7 +32,7 @@ parser.add_argument("--data_path", type=str, default='greyscale.npz', help="file
 # Model training 
 parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
 parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
-parser.add_argument("--lr", type=float, default=0.0001, help="learning rate")
+parser.add_argument("--lr", type=float, default=0.01, help="learning rate")
 parser.add_argument("--warmup_steps", type=int, default=500, help="scheduler warmup steps")
 parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
 parser.add_argument("--n_gpu", type=int, default=1, help="number of gpu to use during training")
@@ -49,9 +47,9 @@ parser.add_argument("--channels", type=int, default=1, help="number of image cha
 parser.add_argument("--den_timesteps", type=int, default=1000, help="number of noising timesteps")
 parser.add_argument("--inf_timesteps", type=int, default=50, help="number of denoising timesteps")
 parser.add_argument("--time_dim", type=int, default=128, help="time embedding dimension in the UNet")
-parser.add_argument("--base_dim", type=int, default=32, help="base dimension in the UNet")
+parser.add_argument("--base_dim", type=int, default=16, help="base dimension in the UNet")
 parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
-parser.add_argument("--sample_size", type=int, default=36, help="number of samples that are generated")
+parser.add_argument("--sample_size", type=int, default=64, help="number of samples that are generated")
 parser.add_argument("--apply_sym", type=bool, default=True, help="if symmetry operations need to be applied during sampling from data")
 
 
@@ -85,7 +83,7 @@ def main():
                    num_workers=args.n_cpu
                   )
         
-    model = GAN(
+    model = Diffusion(
                 args.channels,
                 *image_size,
                 args.base_dim,
@@ -103,6 +101,13 @@ def main():
         strategy = 'ddp'
     else:
         strategy = None
+        
+    checkpoint_callback = ModelCheckpoint(
+                                            save_top_k=1,
+                                            monitor="loss",
+                                            mode="min",
+                                            filename="best_loss-{epoch:02d}-{loss:.2f}",
+                                        )
     
     trainer = Trainer(
         default_root_dir=args.dir,
@@ -112,8 +117,7 @@ def main():
         max_epochs=args.n_epochs,
         strategy = strategy,
         deterministic = True,
-        callbacks=[TQDMProgressBar(refresh_rate=(args.data_length//(20*args.batch_size)))],
-        gradient_clip_val=args.clip_value
+        callbacks=[TQDMProgressBar(refresh_rate=(args.data_length//(40*args.batch_size))),checkpoint_callback]
     )
     
     trainer.fit(model, dm)
@@ -164,7 +168,7 @@ class MicroData(LightningDataModule):
                           num_workers=self.num_workers)
     
     
-class GAN(LightningModule):
+class Diffusion(LightningModule):
     def __init__(
         self,
         channels,
@@ -189,13 +193,13 @@ class GAN(LightningModule):
         self.save_freq = save_freq
         
         # network
-        self.unet = Unet(size=height,timesteps=den_timesteps,time_embedding_dim=time_dim,base_dim=base_dim,dim_mults=[2,4])
+        #self.unet = Unet(size=height,timesteps=den_timesteps,time_embedding_dim=time_dim,base_dim=base_dim,dim_mults=[2,4])
+        self.unet = UNet(image_channels = channels,
+                         n_channels=base_dim,n_blocks=2)
         
-        #self.unet = UNet_New(height,1,1,den_timesteps)
-        
-        self.noise_scheduler = DDIMScheduler(num_train_timesteps=den_timesteps)
-        self.pipeline = DDIMPipeline(unet = self.unet, scheduler = self.noise_scheduler)
-        self.sample_amt = sample_amt
+        self.noise_scheduler = DDIMSampler(den_timesteps,inf_timesteps)
+        self.sample_shape = (sample_amt,channels,height,width,depth)
+        self.mse = nn.MSELoss()
 
     def mse_loss(self, y_hat, y):
         return F.mse_loss(y_hat.flatten(), y.flatten())
@@ -209,10 +213,10 @@ class GAN(LightningModule):
         
         timesteps = torch.randint(0,self.hparams.den_timesteps,(bs,),device=imgs.device).long()
         
-        noisy_imgs = self.noise_scheduler.add_noise(imgs,noise,timesteps)
+        noisy_imgs = self.noise_scheduler.add_noise(imgs,timesteps,noise)
         noise_pred = self.unet(noisy_imgs,timesteps)
         
-        loss = self.mse_loss(noise_pred,noise)        
+        loss = self.mse(noise_pred,noise)
         self.log("loss", loss, prog_bar=True)
         
         return loss
@@ -220,23 +224,17 @@ class GAN(LightningModule):
     def configure_optimizers(self):
         
         lr = self.hparams.lr
-        warmup = self.hparams.warmup_steps
-        
         optimizer = AdamW(self.unet.parameters(), lr=lr)
-        scheduler_lr = get_cosine_schedule_with_warmup(optimizer,num_warmup_steps=warmup,
-                                                      num_training_steps = self.trainer.estimated_stepping_batches)
         
-        return [[optimizer],[scheduler_lr]]
+        return [optimizer]
     
-    def lr_scheduler_step(self, *args):
-        if self.trainer.global_step > self.hparams.warmup_steps:
-            super().lr_scheduler_step(*args)
-    
+    @torch.no_grad()
     def training_epoch_end(self,training_step_outputs):
         
         if (self.current_epoch)%self.save_freq==0:
-            sample_imgs = self.pipeline(batch_size=self.sample_amt,
-                               generator = torch.manual_seed(42),output_type='np.array')
+            sample_imgs = self.noise_scheduler.sample(self.unet,self.sample_shape).cpu().detach()
+            sample_imgs = torch.clamp(sample_imgs,-1,1)
+            sample_imgs = sample_imgs.numpy()
             np.save(f'{self.logger.log_dir}/{self.current_epoch}.npy',sample_imgs)
             
 
